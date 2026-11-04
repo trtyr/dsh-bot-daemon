@@ -107,6 +107,26 @@ pub fn index(request: Request) {
                 "desc": "列出所有群，含成员、会话与正在工作的进程"
             },
             {
+                "method": "POST", "path": "/groups/resolve",
+                "desc": "按会话找群：同一个 originSession 永远返回同一个群，没有就建一个（D020）。插件用它实现「会话开就建群」。",
+                "body": {
+                    "originSession": "string —— 本会话的 session id（可空，空则每次新建）",
+                    "origin?": "string —— 发起者名字，默认 jiangwantang",
+                    "label?": "string —— 群名"
+                },
+                "response": { "groupId": "string", "created": "boolean" }
+            },
+            {
+                "method": "POST", "path": "/groups/pause | /groups/resume",
+                "desc": "暂停/恢复一个群（D026）。暂停时 /run 返回 GROUP_PAUSED 且不建 job。",
+                "body": { "groupId": "string" }
+            },
+            {
+                "method": "POST", "path": "/groups/archive | /groups/unarchive",
+                "desc": "归档/取回一个群。归档 = 移出活跃列表，数据全留（D026）。",
+                "body": { "groupId": "string" }
+            },
+            {
                 "method": "POST", "path": "/run",
                 "desc": "让一个 BOT 干活。默认等它答完（同步）；传 async:true 立刻返回 jobId（D019）。同 groupId 下会话连续，跨 groupId 完全隔离。",
                 "body": {
@@ -144,6 +164,7 @@ pub fn index(request: Request) {
         "errors": {
             "BOT_NOT_FOUND": { "http": 404, "desc": "没有这个 BOT（details.available 给可用名单；中文名会自动解析）" },
             "GROUP_NOT_FOUND": { "http": 404, "desc": "没有这个群" },
+            "GROUP_PAUSED": { "http": 409, "desc": "群是暂停状态，先 resume 再来派活" },
             "INVALID_REQUEST": { "http": 400, "desc": "参数缺失或非法" },
             "BOT_TIMEOUT": { "http": 504, "desc": "BOT 超时" },
             "BOT_NO_ANSWER": { "http": 502, "desc": "BOT 退出但没给最终答案" },

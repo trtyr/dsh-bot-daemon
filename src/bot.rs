@@ -91,6 +91,8 @@ fn resolve_alias(agents_dir: &Path, name: &str) -> String {
 }
 
 pub struct RunOutcome {
+    /// 解析后的目录名（中文名进来时会被换成 zhongshiyu 这类）
+    pub bot: String,
     pub reply: String,
     pub session_id: Option<String>,
     pub pid: u32,
@@ -155,6 +157,20 @@ pub fn run(
         _ => format!("{}{}", header, message),
     };
     cmd.arg(&full_message);
+
+    // 告诉这个 BOT「你在哪个群」。
+    //
+    // 为什么必须传：插件要按会话 resolve 群，而 **BOT 自己的 session 不是主会话**——
+    // 不告诉它，它就会 resolve 出一个新群，然后 group_whoami 报错群、
+    // bot_escalate 把求援写进一个没人看的空群（实测抓到过）。
+    if let Some(gid) = group_id {
+        cmd.env("DSH_BOT_GROUP_ID", gid);
+    }
+    if let Some(from) = sender {
+        cmd.env("DSH_BOT_SENDER", from);
+    }
+    cmd.env("DSH_BOT_NAME", name);
+
     cmd.current_dir(&agent_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -234,20 +250,9 @@ pub fn run(
         groups.write_session(&sess_path, sid);
     }
 
-    // 派活即入群（D028）：真写进 meta.json，不靠 list() 拿会话反推。
+    // 派活即入群（D028）已经移到 spawn 之前做（main.rs）——
+    // 放在这里会让 BOT 干活时查 group_whoami **看不见自己**（实测抓到）。
     if let Some(gid) = group_id {
-        if groups.ensure_member(gid, name, "worker") {
-            groups.append_event(
-                gid,
-                json!({
-                    "at": crate::group::now_stamp(),
-                    "event": "member.joined",
-                    "group": gid,
-                    "bot": name,
-                    "why": "dispatched",
-                }),
-            );
-        }
         let ok = final_text.is_some() && !timed_out;
         groups.append_event(
             gid,
@@ -277,6 +282,7 @@ pub fn run(
             log_info!("bot.finish", bot = name, ok = true, ms = ms, chars = reply.chars().count());
             let continued = session_id.is_some();
             Ok(RunOutcome {
+                bot: name.to_string(),
                 reply,
                 session_id: session_id.or(existing),
                 pid,

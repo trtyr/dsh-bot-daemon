@@ -203,6 +203,47 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                 );
             }
 
+            // ---- 追加群史事件（供插件上报求援等）----
+            (Method::Post, "/groups/log") => {
+                let body = read_body(&mut request);
+                let gid = body
+                    .get("groupId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if gid.is_empty() {
+                    api::fail(
+                        request,
+                        &DaemonError::InvalidRequest {
+                            field: "groupId",
+                            reason: "必填".into(),
+                        },
+                    );
+                    return;
+                }
+                let mut event = body.get("event").cloned().unwrap_or(json!({}));
+                if let Some(obj) = event.as_object_mut() {
+                    obj.insert("at".into(), json!(group::now_stamp()));
+                    obj.insert("group".into(), json!(gid));
+                }
+                let store = {
+                    let s = lock(&state);
+                    GroupStore::new(s.groups.root.clone())
+                };
+                if !store.exists(&gid) {
+                    api::fail(
+                        request,
+                        &DaemonError::GroupNotFound {
+                            group_id: gid.clone(),
+                        },
+                    );
+                    return;
+                }
+                store.append_event(&gid, event);
+                api::ok(request, json!({ "groupId": gid, "logged": true }));
+            }
+
             // ---- 按会话找群 / 建群（D020：群由会话生）----
             (Method::Post, "/groups/resolve") => {
                 let body = read_body(&mut request);
@@ -625,7 +666,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                                 let mb = groups_bg.write_mailbox(
                                     gid_bg.as_deref(),
                                     &job_bg,
-                                    &name_bg,
+                                    &o.bot,
                                     &o.reply,
                                     sender_bg.as_deref(),
                                 );
@@ -676,6 +717,35 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     let s = lock(&state);
                     GroupStore::new(s.groups.root.clone())
                 };
+
+                // D028 派活即入群：**在 spawn 之前**真写进 meta.json。
+                // 晚一步的话，BOT 干活时 group_whoami 看不见自己。
+                if let Some(gid) = &group_id {
+                    if groups.ensure_member(gid, &name, "worker") {
+                        groups.append_event(
+                            gid,
+                            json!({
+                                "at": group::now_stamp(),
+                                "event": "member.joined",
+                                "group": gid,
+                                "bot": name,
+                                "why": "dispatched",
+                            }),
+                        );
+                    }
+                    groups.append_event(
+                        gid,
+                        json!({
+                            "at": group::now_stamp(),
+                            "event": "task.dispatched",
+                            "group": gid,
+                            "job": if is_async { json!(job_id) } else { json!(null) },
+                            "bot": name,
+                            "from": sender,
+                        }),
+                    );
+                }
+
                 let state_for_pid = state.clone();
                 let key_for_pid = key.clone();
                 let result = bot::run(
