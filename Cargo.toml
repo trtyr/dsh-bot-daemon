@@ -2,9 +2,10 @@
 name = "dsh-bot-daemon"
 version = "0.1.0"
 edition = "2024"
+
 description = "BOT team runtime daemon for DeepSeek Harness (dsh): team lifecycle, headless bot spawn with PID-based identity, session isolation per team, pause/resume with atomic snapshots."
 license = "MIT"
-repository = "https://github.com/trtyr/devforge"
+repository = "https://github.com/trtyr/dsh-bot-daemon"
 readme = "README.md"
 
 
