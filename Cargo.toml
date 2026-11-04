@@ -1,0 +1,8 @@
+[package]
+name = "dsh-bot-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde_json = "1.0.154"
+tiny_http = "0.12.0"
