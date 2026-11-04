@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! 请求进来
-//!   → bot.start      记 name/team/pid
+//!   → bot.start      记 name/group/pid
 //!   → 读 .session     有就 --session-id 续上
 //!   → spawn dsh
 //!   → 逐行解析 --json 事件流（session / final）
@@ -17,16 +17,78 @@
 //! 那样得等进程退出才拿到全部输出，超时就没法中断。
 //! 这里逐行读 stdout，**到点就能 kill**，而且能实时看到 session id。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::error::DaemonError;
-use crate::team::TeamStore;
+use crate::group::GroupStore;
 use crate::{log_debug, log_error, log_info, log_warn};
+
+/// 中文名 → 目录名 的缓存。BOT 名单在运行时不会变，扫一次就够。
+fn alias_cache() -> &'static Mutex<Option<HashMap<String, String>>> {
+    static CACHE: OnceLock<Mutex<Option<HashMap<String, String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 从 `AGENTS.md` 首行取中文名。格式：`# 苏见微（本地检索 Agent）`。
+fn display_name_from(agents_dir: &Path, bot: &str) -> Option<String> {
+    let head = std::fs::read_to_string(agents_dir.join(bot).join("AGENTS.md")).ok()?;
+    let first = head.lines().next()?.trim().to_string();
+    let rest = first.strip_prefix("# ")?.to_string();
+    // 砍掉「（角色）」后缀
+    let cut = rest.split(['（', '(']).next()?.trim().to_string();
+    if cut.is_empty() {
+        None
+    } else {
+        Some(cut)
+    }
+}
+
+/// 把中文名解析成目录名。找不到就原样返回。
+///
+/// 为什么需要：`agents_dir.join("钟诗雨")` 这个目录不存在，
+/// 于是调用方拿到 BOT_NOT_FOUND。实测苏见微 7 次调用里 4 次用了中文名，
+/// 每次都要先失败一次才知道该用 `zhongshiyu`。
+fn resolve_alias(agents_dir: &Path, name: &str) -> String {
+    let direct = agents_dir.join(name);
+    if direct.is_dir() {
+        return name.to_string();
+    }
+    // 只在名字里含非 ASCII 时才有必要扫；纯英文名走原路径，省一次全目录扫描
+    if name.is_ascii() {
+        return name.to_string();
+    }
+
+    let mut guard = match alias_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_none() {
+        let mut map = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(agents_dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let Some(bot) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if let Some(display) = display_name_from(agents_dir, &bot) {
+                    map.insert(display, bot);
+                }
+            }
+        }
+        *guard = Some(map);
+    }
+    let map = guard.as_ref().expect("filled above");
+    map.get(name).cloned().unwrap_or_else(|| name.to_string())
+}
 
 pub struct RunOutcome {
     pub reply: String,
@@ -39,16 +101,21 @@ pub struct RunOutcome {
 /// 跑一个 BOT，等它答完。失败返回结构化错误。
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    teams: &TeamStore,
+    groups: &GroupStore,
     agents_dir: &Path,
     name: &str,
     message: &str,
-    team_id: Option<&str>,
+    group_id: Option<&str>,
     sender: Option<&str>,
     timeout_ms: u64,
     // spawn 成功后立刻回报真实 PID —— 身份反查要靠它，不能是 0
     on_spawn: &dyn Fn(u32),
 ) -> Result<RunOutcome, DaemonError> {
+    // 中文名 → 目录名（「钟诗雨」→ zhongshiyu）。解析不到就原样往下走，
+    // 让下面那句 is_dir() 去报 BOT_NOT_FOUND —— 错误信息里带可用名单。
+    let resolved = resolve_alias(agents_dir, name);
+    let name: &str = &resolved;
+
     let agent_dir = agents_dir.join(name);
     if !agent_dir.is_dir() {
         let available = list_available(agents_dir);
@@ -58,25 +125,25 @@ pub fn run(
         });
     }
 
-    let sess_path = teams.session_path(agents_dir, team_id, name);
-    let existing = teams.read_session(&sess_path);
+    let sess_path = groups.session_path(agents_dir, group_id, name);
+    let existing = groups.read_session(&sess_path);
 
     let mut cmd = Command::new("dsh");
     cmd.arg("--profile").arg(name).arg("--json");
     if let Some(sid) = &existing {
         cmd.arg("--session-id").arg(sid);
     }
-    // 长期记忆：跨 Team 共享的那份（D003）。人设里没有它，它是「学到的经验」。
+    // 长期记忆：跨 群 共享的那份（D003）。人设里没有它，它是「学到的经验」。
     // 短期记忆（会话）在 teams/<id>/sessions/<bot>.session，两份互不干扰。
     let memory_note = read_long_term_memory(&agent_dir);
     // 消息头：告诉它「谁在问、在哪个 Team」。
     //
     // 这不是环境变量、也不是配置文件 —— 是**调用现场的事实**：
     // 谁发起的、属于哪个 Team，由 daemon 从 PID 反查得到，写在这一句里。
-    let header = match (sender, team_id) {
-        (Some(from), Some(team)) => format!("[来自 {} · Team {}]\n", from, team),
+    let header = match (sender, group_id) {
+        (Some(from), Some(team)) => format!("[来自 {} · 群 {}]\n", from, team),
         (Some(from), None) => format!("[来自 {}]\n", from),
-        (None, Some(team)) => format!("[Team {}]\n", team),
+        (None, Some(team)) => format!("[群 {}]\n", team),
         (None, None) => String::new(),
     };
 
@@ -108,7 +175,7 @@ pub fn run(
         "bot.start",
         bot = name,
         pid = pid,
-        team = team_id.unwrap_or("-"),
+        team = group_id.unwrap_or("-"),
         resumed = existing.is_some()
     );
 
@@ -164,7 +231,37 @@ pub fn run(
     let stderr_text = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
 
     if let Some(sid) = &session_id {
-        teams.write_session(&sess_path, sid);
+        groups.write_session(&sess_path, sid);
+    }
+
+    // 派活即入群（D028）：真写进 meta.json，不靠 list() 拿会话反推。
+    if let Some(gid) = group_id {
+        if groups.ensure_member(gid, name, "worker") {
+            groups.append_event(
+                gid,
+                json!({
+                    "at": crate::group::now_stamp(),
+                    "event": "member.joined",
+                    "group": gid,
+                    "bot": name,
+                    "why": "dispatched",
+                }),
+            );
+        }
+        let ok = final_text.is_some() && !timed_out;
+        groups.append_event(
+            gid,
+            json!({
+                "at": crate::group::now_stamp(),
+                "event": if ok { "task.returned" } else { "task.failed" },
+                "group": gid,
+                "bot": name,
+                "from": sender,
+                "ms": ms,
+                "replyChars": final_text.as_ref().map(|r| r.chars().count()).unwrap_or(0),
+                "session": session_id.as_deref(),
+            }),
+        );
     }
 
     if timed_out || final_text.is_none() && ms >= timeout_ms {
@@ -209,8 +306,8 @@ pub fn run(
 /// 读长期记忆文件：`~/.dsh/agents/<bot>/memory.md`。
 ///
 /// **为什么是文件而不是会话**：
-///   - 会话按 Team 隔离（D009），跨任务不通
-///   - 长期记忆要跨任务共享（D003），所以放在 Team 之外
+///   - 会话按 群 隔离（D009），跨任务不通
+///   - 长期记忆要跨任务共享（D003），所以放在 群 之外
 ///   - 用人可读的 markdown，用户能直接改，BOT 也能自己追加
 ///
 /// **为什么不塞进 AGENTS.md**：那是人设（身份），改它等于改它这个人。
@@ -272,7 +369,7 @@ pub fn snapshot(
             "name": name,
             "status": if active.is_some() { "working" } else { "idle" },
             "pid": active.map(|(_, pid, _)| *pid),
-            "teamId": active.and_then(|(_, _, t)| t.clone()),
+            "groupId": active.and_then(|(_, _, t)| t.clone()),
         }));
     }
     bots.sort_by(|a, b| {

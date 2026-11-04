@@ -97,29 +97,43 @@ pub fn index(request: Request) {
                 "response": { "daemonPid": "number", "uptimeSec": "number", "running": "number", "maxConcurrent": "number" }
             },
             {
-                "method": "POST", "path": "/teams",
-                "desc": "建一个 Team，返回 teamId",
+                "method": "POST", "path": "/groups",
+                "desc": "建一个群，返回 groupId",
                 "body": { "label?": "string —— 人类可读的名字，比如「绘画任务」" },
-                "response": { "teamId": "string", "createdAt": "string" }
+                "response": { "groupId": "string", "createdAt": "string" }
             },
             {
-                "method": "GET", "path": "/teams",
-                "desc": "列出所有 Team，含成员会话与正在工作的进程"
+                "method": "GET", "path": "/groups",
+                "desc": "列出所有群，含成员、会话与正在工作的进程"
             },
             {
                 "method": "POST", "path": "/run",
-                "desc": "让一个 BOT 干活并等它答完。同 teamId 下会话连续，跨 teamId 完全隔离。",
+                "desc": "让一个 BOT 干活。默认等它答完（同步）；传 async:true 立刻返回 jobId（D019）。同 groupId 下会话连续，跨 groupId 完全隔离。",
                 "body": {
-                    "name": "string —— BOT 名（~/.dsh/agents 下的目录名）",
+                    "name": "string —— BOT 名（目录名或中文名，如 zhongshiyu / 钟诗雨）",
                     "message": "string",
-                    "teamId?": "string —— 不传就走全局会话（会串台，仅调试用）",
-                    "timeoutMs?": "number"
+                    "groupId?": "string —— 不传就走全局会话（会串台，仅调试用）",
+                    "timeoutMs?": "number",
+                    "async?": "boolean —— true 时不等待，返回 jobId",
+                    "onParentClose?": "string —— terminate(默认) / abandon / request_cancel（D024）"
                 },
-                "response": { "reply": "string", "sessionId": "string", "pid": "number", "ms": "number" }
+                "response": {
+                    "sync": { "reply": "string", "sessionId": "string", "pid": "number", "ms": "number" },
+                    "async": { "jobId": "string", "status": "running", "bot": "string", "groupId": "string" }
+                }
             },
             {
-                "method": "GET", "path": "/bots?teamId=xxx",
-                "desc": "看各 BOT 状态。带 teamId 只看这个 Team。"
+                "method": "GET", "path": "/jobs/:jobId",
+                "desc": "查一个异步 job 的状态与结果（D019）",
+                "response": { "jobId": "string", "status": "running|done|failed|orphan", "reply": "string", "mailbox": "string", "pid": "number", "ms": "number" }
+            },
+            {
+                "method": "GET", "path": "/jobs?groupId=xxx&status=done",
+                "desc": "列 job。可按群、按状态过滤——孤儿 job 用 status=orphan 找"
+            },
+            {
+                "method": "GET", "path": "/bots?groupId=xxx",
+                "desc": "看各 BOT 状态。带 groupId 只看这个群。"
             },
             {
                 "method": "POST", "path": "/stop",
@@ -128,10 +142,9 @@ pub fn index(request: Request) {
             }
         ],
         "errors": {
-            "BOT_NOT_FOUND": { "http": 404, "desc": "没有这个 BOT" },
-            "TEAM_NOT_FOUND": { "http": 404, "desc": "没有这个 Team" },
+            "BOT_NOT_FOUND": { "http": 404, "desc": "没有这个 BOT（details.available 给可用名单；中文名会自动解析）" },
+            "GROUP_NOT_FOUND": { "http": 404, "desc": "没有这个群" },
             "INVALID_REQUEST": { "http": 400, "desc": "参数缺失或非法" },
-            "CONCURRENT_LIMIT": { "http": 429, "desc": "并发已满，稍后重试" },
             "BOT_TIMEOUT": { "http": 504, "desc": "BOT 超时" },
             "BOT_NO_ANSWER": { "http": 502, "desc": "BOT 退出但没给最终答案" },
             "SPAWN_FAILED": { "http": 500, "desc": "进程起不来" },

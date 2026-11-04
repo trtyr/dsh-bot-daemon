@@ -26,15 +26,15 @@
 //! | `error` | 错误类型、错误码、HTTP 状态映射 |
 //! | `logging` | 结构化日志、级别、落文件 |
 //! | `api` | 统一响应格式、接口自描述 |
-//! | `team` | Team 目录、成员会话归属 |
+//! | `team` | 群 目录、成员会话归属 |
 //! | `bot` | 起停 BOT、解析事件流、超时 |
 //!
 //! ## 协议
 //!
 //!   GET  /          接口清单（自描述）
 //!   GET  /health    健康检查
-//!   GET  /teams     列 Team
-//!   POST /teams     建 Team
+//!   GET  /groups     列 Team
+//!   POST /groups     建 Team
 //!   POST /run       让 BOT 干活
 //!   GET  /bots      看 BOT 状态
 //!   POST /stop      停 BOT
@@ -43,7 +43,8 @@ mod api;
 mod bot;
 mod error;
 mod logging;
-mod team;
+mod group;
+mod job;
 
 use std::collections::HashMap;
 use std::env;
@@ -57,15 +58,17 @@ use tiny_http::{Method, Server};
 
 use error::DaemonError;
 use logging::Level;
-use team::TeamStore;
+use group::GroupStore;
 
 /// 进程内共享状态。**锁中毒不 panic**：用 `unwrap_or_else` 恢复。
 pub struct State {
-    /// key = "{teamId}:{bot}"，value = (pid, started)
+    /// key = "{groupId}:{bot}"，value = (pid, started)
     pub running: HashMap<String, (u32, Instant)>,
+    /// 异步 job 表（D019）。同步调用不建 job。
+    pub jobs: HashMap<String, job::Job>,
     pub started_at: Instant,
     pub agents_dir: PathBuf,
-    pub teams: TeamStore,
+    pub groups: GroupStore,
     pub max_concurrent: usize,
     pub default_timeout_ms: u64,
 }
@@ -77,10 +80,10 @@ fn lock(state: &Shared) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 反查：这个 PID 是哪个 Team 的哪个 BOT？
+/// 反查：这个 PID 是哪个 群 的哪个 BOT？
 ///
 /// **这是「身份」的唯一权威来源。**
-/// BOT 不需要知道自己的 teamId —— 它调进来时报 `process.pid`，
+/// BOT 不需要知道自己的 groupId —— 它调进来时报 `process.pid`，
 /// 我们查表就知道它是谁家的孩子。
 ///
 /// 为什么可信：PID 是操作系统给的，只有真的被我们 spawn 出来的进程才会有条目。
@@ -128,7 +131,7 @@ fn main() {
         .unwrap_or(300_000);
 
     let agents_dir = PathBuf::from(format!("{}/agents", dsh_home));
-    let teams_root = PathBuf::from(format!("{}/teams", dsh_home));
+    let groups_root = PathBuf::from(format!("{}/groups", dsh_home));
 
     let addr = format!("127.0.0.1:{}", port);
     let server = match Server::http(&addr) {
@@ -144,16 +147,17 @@ fn main() {
         addr = &addr,
         pid = std::process::id(),
         agents = &agents_dir.display(),
-        teams = &teams_root.display(),
+        groups = &groups_root.display(),
         max_concurrent = max_concurrent,
         timeout_ms = default_timeout_ms
     );
 
     let state: Shared = Arc::new(Mutex::new(State {
         running: HashMap::new(),
+        jobs: HashMap::new(),
         started_at: Instant::now(),
         agents_dir,
-        teams: TeamStore::new(teams_root),
+        groups: GroupStore::new(groups_root),
         max_concurrent,
         default_timeout_ms,
     }));
@@ -161,8 +165,8 @@ fn main() {
     // ⚠️ 每个请求一个线程。
     //
     // 之前是 `for request in server.incoming_requests()` 串行处理 ——
-    // /run 一次要等几十秒到几分钟，期间别的请求（/teams、/health）全被堵住。
-    // 实测：苏见微调钟诗雨时嵌套两次推理，/teams 直接超时。
+    // /run 一次要等几十秒到几分钟，期间别的请求（/groups、/health）全被堵住。
+    // 实测：苏见微调钟诗雨时嵌套两次推理，/groups 直接超时。
     //
     // 并发上限由 max_concurrent 控（/run 里检查），不是靠串行控。
     for request in server.incoming_requests() {
@@ -199,7 +203,100 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                 );
             }
 
-            (Method::Get, "/teams") => {
+            // ---- 按会话找群 / 建群（D020：群由会话生）----
+            (Method::Post, "/groups/resolve") => {
+                let body = read_body(&mut request);
+                let session = body
+                    .get("originSession")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let origin = body
+                    .get("origin")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("jiangwantang")
+                    .to_string();
+                let label = body.get("label").and_then(|v| v.as_str());
+
+                let store = {
+                    let s = lock(&state);
+                    GroupStore::new(s.groups.root.clone())
+                };
+                // 先找：同一会话 resume 回来必须是同一个群
+                if !session.is_empty() {
+                    if let Some(gid) = store.find_by_session(&session) {
+                        api::ok(request, json!({ "groupId": gid, "created": false }));
+                        return;
+                    }
+                }
+                match store.create_with_session(
+                    label,
+                    Some(&origin),
+                    if session.is_empty() { None } else { Some(&session) },
+                ) {
+                    Ok(gid) => api::ok(request, json!({ "groupId": gid, "created": true })),
+                    Err(e) => api::fail(request, &e),
+                }
+            }
+
+            // ---- 异步 job 查询（D019）----
+            (Method::Get, p) if p.starts_with("/jobs/") => {
+                let id = p.trim_start_matches("/jobs/").to_string();
+                let found = {
+                    let s = lock(&state);
+                    s.jobs.get(&id).map(|j| j.to_json())
+                };
+                match found {
+                    Some(v) => api::ok(request, v),
+                    None => api::fail(
+                        request,
+                        &DaemonError::InvalidRequest {
+                            field: "jobId",
+                            reason: format!("没有这个 job：{}", id),
+                        },
+                    ),
+                }
+            }
+
+            (Method::Get, "/jobs") => {
+                let group_filter = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("groupId="))
+                    .map(|s| s.to_string());
+                let status_filter = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("status="))
+                    .map(|s| s.to_string());
+                let jobs: Vec<Value> = {
+                    let s = lock(&state);
+                    let mut v: Vec<Value> = s
+                        .jobs
+                        .values()
+                        .filter(|j| {
+                            group_filter
+                                .as_deref()
+                                .map(|g| j.group_id.as_deref() == Some(g))
+                                .unwrap_or(true)
+                                && status_filter
+                                    .as_deref()
+                                    .map(|st| j.status.as_str() == st)
+                                    .unwrap_or(true)
+                        })
+                        .map(|j| j.to_json())
+                        .collect();
+                    v.sort_by(|a, b| {
+                        b.get("jobId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .cmp(a.get("jobId").and_then(|v| v.as_str()).unwrap_or(""))
+                    });
+                    v
+                };
+                api::ok(request, json!({ "jobs": jobs, "count": jobs.len() }));
+            }
+
+            (Method::Get, "/groups") => {
                 let working: Vec<(String, Option<String>)> = {
                     let s = lock(&state);
                     s.running
@@ -207,7 +304,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                         .map(|_| (String::new(), None))
                         .collect()
                 };
-                let _ = working; // 占位：working 明细在下面按 teamId 查
+                let _ = working; // 占位：working 明细在下面按 groupId 查
                 let snapshot = {
                     let s = lock(&state);
                     let mut map: HashMap<String, Vec<Value>> = HashMap::new();
@@ -225,45 +322,45 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     let s = lock(&state);
                     let include_archived = query.contains("includeArchived=true")
                         || query.contains("includeArchived=1");
-                    s.teams.list(
-                        |team_id| snapshot.get(team_id).cloned().unwrap_or_default(),
+                    s.groups.list(
+                        |group_id| snapshot.get(group_id).cloned().unwrap_or_default(),
                         include_archived,
                     )
                 };
                 api::ok(request, payload);
             }
 
-            (Method::Post, "/teams") => {
+            (Method::Post, "/groups") => {
                 let body = read_body(&mut request);
                 let label = body.get("label").and_then(|v| v.as_str());
-                // 发起者：谁建的 Team 谁就是 captain（D010）
+                // 发起者：谁建的 群 谁就是 captain（D010 / D025）
                 let origin = body.get("origin").and_then(|v| v.as_str());
                 let result = {
                     let s = lock(&state);
-                    s.teams.create(label, origin)
+                    s.groups.create(label, origin)
                 };
                 match result {
-                    Ok(team_id) => api::ok(
+                    Ok(group_id) => api::ok(
                         request,
-                        json!({ "teamId": team_id, "createdAt": team::now_stamp() }),
+                        json!({ "groupId": group_id, "createdAt": group::now_stamp() }),
                     ),
                     Err(e) => api::fail(request, &e),
                 }
             }
 
-            (Method::Post, "/teams/archive") | (Method::Post, "/teams/unarchive") => {
+            (Method::Post, "/groups/archive") | (Method::Post, "/groups/unarchive") => {
                 let body = read_body(&mut request);
-                let team_id = body
-                    .get("teamId")
+                let group_id = body
+                    .get("groupId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if team_id.is_empty() {
+                if group_id.is_empty() {
                     api::fail(
                         request,
                         &DaemonError::InvalidRequest {
-                            field: "teamId",
+                            field: "groupId",
                             reason: "必填".into(),
                         },
                     );
@@ -273,33 +370,33 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                 let result = {
                     let s = lock(&state);
                     if is_archive {
-                        s.teams.archive(&team_id)
+                        s.groups.archive(&group_id)
                     } else {
-                        s.teams.unarchive(&team_id)
+                        s.groups.unarchive(&group_id)
                     }
                 };
                 match result {
                     Ok(()) => api::ok(
                         request,
-                        json!({ "teamId": team_id, "archived": is_archive }),
+                        json!({ "groupId": group_id, "archived": is_archive }),
                     ),
                     Err(e) => api::fail(request, &e),
                 }
             }
 
-            (Method::Post, "/teams/pause") | (Method::Post, "/teams/resume") => {
+            (Method::Post, "/groups/pause") | (Method::Post, "/groups/resume") => {
                 let body = read_body(&mut request);
-                let team_id = body
-                    .get("teamId")
+                let group_id = body
+                    .get("groupId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if team_id.is_empty() {
+                if group_id.is_empty() {
                     api::fail(
                         request,
                         &DaemonError::InvalidRequest {
-                            field: "teamId",
+                            field: "groupId",
                             reason: "必填".into(),
                         },
                     );
@@ -307,14 +404,14 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                 }
                 let is_pause = path.ends_with("/pause");
 
-                // 暂停时先把该 Team 正在跑的进程杀掉（D001：序列化之后杀）
+                // 暂停时先把该 群 正在跑的进程杀掉（D001：序列化之后杀）
                 let mut killed = 0u32;
                 if is_pause {
                     let pids: Vec<u32> = {
                         let s = lock(&state);
                         s.running
                             .iter()
-                            .filter(|(k, _)| k.starts_with(&format!("{}:", team_id)))
+                            .filter(|(k, _)| k.starts_with(&format!("{}:", group_id)))
                             .filter_map(|(_, (pid, _))| if *pid > 0 { Some(*pid) } else { None })
                             .collect()
                     };
@@ -326,16 +423,16 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                         {
                             killed += 1;
                         }
-                        log_warn!("team.pause_killed", team = &team_id, pid = pid);
+                        log_warn!("team.pause_killed", team = &group_id, pid = pid);
                     }
                 }
 
                 let result = {
                     let s = lock(&state);
                     if is_pause {
-                        s.teams.pause(&team_id)
+                        s.groups.pause(&group_id)
                     } else {
-                        s.teams.resume(&team_id)
+                        s.groups.resume(&group_id)
                     }
                 };
                 match result {
@@ -385,25 +482,25 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     return;
                 }
 
-                // ---- 身份：优先用 PID 反查，其次用显式 teamId ----
+                // ---- 身份：优先用 PID 反查，其次用显式 groupId ----
                 //
                 // callerPid 在 running 表里 → 它是被我们 spawn 的某个 BOT，
                 //   那么它属于哪个 Team、叫什么名字，我们说了算。
                 // 不在表里（或没传）→ 它是外部调用者（主会话 / curl），
-                //   用 body 里的 teamId。
+                //   用 body 里的 groupId。
                 let caller_pid = body
                     .get("callerPid")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
                 let identified = identify_caller(&state, caller_pid);
 
-                let (team_id, sender) = match identified {
+                let (group_id, sender) = match identified {
                     Some((team, bot)) => {
                         log_debug!("caller.identified", pid = caller_pid, team = &team, bot = &bot);
                         (Some(team), Some(bot))
                     }
                     None => (
-                        body.get("teamId")
+                        body.get("groupId")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         // 外部调用者可以自报名字（主会话就是 jiangwantang）
@@ -413,82 +510,180 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     ),
                 };
 
-                // Team 存在性校验：给了 teamId 就必须真的存在
-                if let Some(tid) = &team_id {
+                // 群 存在性校验：给了 groupId 就必须真的存在
+                if let Some(tid) = &group_id {
                     let exists = {
                         let s = lock(&state);
-                        s.teams.exists(tid)
+                        s.groups.exists(tid)
                     };
                     if !exists {
                         api::fail(
                             request,
-                            &DaemonError::TeamNotFound {
-                                team_id: tid.clone(),
+                            &DaemonError::GroupNotFound {
+                                group_id: tid.clone(),
                             },
                         );
                         return;
                     }
-                    // 暂停的 Team 拒绝派活（D001 的「暂停」在这里生效）
+                    // 暂停的 群 拒绝派活（D001 的「暂停」在这里生效）
                     let paused = {
                         let s = lock(&state);
-                        s.teams.is_paused(tid)
+                        s.groups.is_paused(tid)
                     };
                     if paused {
                         api::fail(
                             request,
-                            &DaemonError::TeamPaused {
-                                team_id: tid.clone(),
+                            &DaemonError::GroupPaused {
+                                group_id: tid.clone(),
                             },
                         );
                         return;
                     }
                 }
 
-                let (agents_dir, timeout_default, running_count, max) = {
+                // D023：不设并发上限。槽位不拦、不排队，让 OS 管内存。
+                // 注意 `running` 表本身仍然维护——它是 PID 反查的唯一依据（D013/D019）。
+                let (agents_dir, timeout_default) = {
                     let s = lock(&state);
-                    (
-                        s.agents_dir.clone(),
-                        s.default_timeout_ms,
-                        s.running.len(),
-                        s.max_concurrent,
-                    )
+                    (s.agents_dir.clone(), s.default_timeout_ms)
                 };
-
-                if running_count >= max {
-                    api::fail(
-                        request,
-                        &DaemonError::ConcurrentLimit {
-                            max,
-                            current: running_count,
-                        },
-                    );
-                    return;
-                }
 
                 let timeout_ms = body
                     .get("timeoutMs")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(timeout_default);
 
+                let is_async = body
+                    .get("async")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // D024：父结束时子怎么办。默认 terminate（不放任）。
+                let on_parent_close = body
+                    .get("onParentClose")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("terminate")
+                    .to_string();
+
                 // 登记为运行中
-                let key = format!("{}:{}", team_id.as_deref().unwrap_or("default"), name);
+                let key = format!("{}:{}", group_id.as_deref().unwrap_or("default"), name);
+                let job_id = job::new_job_id();
                 {
                     let mut s = lock(&state);
                     s.running.insert(key.clone(), (0, Instant::now()));
+                    if is_async {
+                        let job = job::Job::new(
+                            job_id.clone(),
+                            name.clone(),
+                            group_id.clone(),
+                            None,                 // parent_job 留空：PID 反查父 job 待补
+                            sender.clone(),
+                            on_parent_close.clone(),
+                        );
+                        s.jobs.insert(job_id.clone(), job);
+                    }
                 }
 
-                let teams = {
+                // ---- 异步分支：起线程跑，立刻返回 jobId（D019）----
+                if is_async {
+                    let state_bg = state.clone();
+                    let key_bg = key.clone();
+                    let job_bg = job_id.clone();
+                    let groups_bg = {
+                        let s = lock(&state);
+                        GroupStore::new(s.groups.root.clone())
+                    };
+                    let agents_bg = agents_dir.clone();
+                    let name_bg = name.clone();
+                    let message_bg = message.clone();
+                    let gid_bg = group_id.clone();
+                    let sender_bg = sender.clone();
+                    std::thread::spawn(move || {
+                        let state_for_pid = state_bg.clone();
+                        let key_for_pid = key_bg.clone();
+                        let job_for_pid = job_bg.clone();
+                        let result = bot::run(
+                            &groups_bg,
+                            &agents_bg,
+                            &name_bg,
+                            &message_bg,
+                            gid_bg.as_deref(),
+                            sender_bg.as_deref(),
+                            timeout_ms,
+                            &move |real_pid: u32| {
+                                if let Ok(mut s) = state_for_pid.lock() {
+                                    if let Some(entry) = s.running.get_mut(&key_for_pid) {
+                                        entry.0 = real_pid;
+                                    }
+                                    if let Some(j) = s.jobs.get_mut(&job_for_pid) {
+                                        j.pid = real_pid;
+                                    }
+                                }
+                            },
+                        );
+                        let (status, reply, err, mailbox) = match &result {
+                            Ok(o) => {
+                                let mb = groups_bg.write_mailbox(
+                                    gid_bg.as_deref(),
+                                    &job_bg,
+                                    &name_bg,
+                                    &o.reply,
+                                    sender_bg.as_deref(),
+                                );
+                                (job::JobStatus::Done, Some(o.reply.clone()), None::<String>, mb)
+                            }
+                            Err(e) => (job::JobStatus::Failed, None, Some(format!("{e}")), None),
+                        };
+                        {
+                            if let Ok(mut s) = state_bg.lock() {
+                                s.running.remove(&key_bg);
+                                if let Some(j) = s.jobs.get_mut(&job_bg) {
+                                    j.status = status;
+                                    j.reply = reply;
+                                    j.error = err;
+                                    j.finished = Some(Instant::now());
+                                    j.mailbox = mailbox.clone();
+                                }
+                            }
+                        }
+                        if let Some(gid) = &gid_bg {
+                            groups_bg.append_event(
+                                gid,
+                                serde_json::json!({
+                                    "at": group::now_stamp(),
+                                    "event": if status == job::JobStatus::Done { "task.returned" } else { "task.failed" },
+                                    "group": gid,
+                                    "job": job_bg,
+                                    "bot": name_bg,
+                                    "mailbox": mailbox,
+                                }),
+                            );
+                        }
+                    });
+                    api::ok(
+                        request,
+                        json!({
+                            "jobId": job_id,
+                            "status": "running",
+                            "bot": name,
+                            "groupId": group_id,
+                            "onParentClose": on_parent_close,
+                        }),
+                    );
+                    return;
+                }
+
+                let groups = {
                     let s = lock(&state);
-                    TeamStore::new(s.teams.root.clone())
+                    GroupStore::new(s.groups.root.clone())
                 };
                 let state_for_pid = state.clone();
                 let key_for_pid = key.clone();
                 let result = bot::run(
-                    &teams,
+                    &groups,
                     &agents_dir,
                     &name,
                     &message,
-                    team_id.as_deref(),
+                    group_id.as_deref(),
                     sender.as_deref(),
                     timeout_ms,
                     &move |real_pid: u32| {
@@ -516,8 +711,8 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             "ms": outcome.ms,
                             "continued": outcome.continued,
                         });
-                        if let Some(tid) = &team_id {
-                            data["teamId"] = json!(tid);
+                        if let Some(tid) = &group_id {
+                            data["groupId"] = json!(tid);
                         }
                         if let Some(from) = &sender {
                             data["from"] = json!(from);
@@ -531,7 +726,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
             (Method::Get, "/bots") => {
                 let team_filter = query
                     .split('&')
-                    .find_map(|kv| kv.strip_prefix("teamId="))
+                    .find_map(|kv| kv.strip_prefix("groupId="))
                     .map(|s| s.to_string());
                 let (agents_dir, running) = {
                     let s = lock(&state);

@@ -18,10 +18,10 @@
 //! | code | HTTP | 含义 | 谁的问题 |
 //! | --- | --- | --- | --- |
 //! | `BOT_NOT_FOUND` | 404 | 没有这个 BOT | 调用方（名字错了/人设没建） |
-//! | `TEAM_NOT_FOUND` | 404 | 没有这个 Team | 调用方 |
-//! | `TEAM_PAUSED` | 409 | Team 已暂停，先 resume | 调用方 |
+//! | `GROUP_NOT_FOUND` | 404 | 没有这个群 | 调用方 |
+//! | `GROUP_PAUSED` | 409 | 群 已暂停，先 resume | 调用方 |
 //! | `INVALID_REQUEST` | 400 | 参数缺失或非法 | 调用方 |
-//! | `CONCURRENT_LIMIT` | 429 | 并发已满 | 调用方（等一下再试） |
+//! | ~~`CONCURRENT_LIMIT`~~ | — | **已废（D023：不设并发上限）** | — |
 //! | `BOT_TIMEOUT` | 504 | BOT 超时没答完 | 环境/模型 |
 //! | `BOT_NO_ANSWER` | 502 | BOT 退出但没给最终答案 | BOT 内部 |
 //! | `SPAWN_FAILED` | 500 | 进程起不来 | 环境（dsh 没装/权限） |
@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 #[derive(Debug)]
 pub enum DaemonError {
     BotNotFound { name: String, available: Vec<String> },
-    TeamNotFound { team_id: String },
-    TeamPaused { team_id: String },
+    GroupNotFound { group_id: String },
+    GroupPaused { group_id: String },
     InvalidRequest { field: &'static str, reason: String },
     ConcurrentLimit { max: usize, current: usize },
     BotTimeout { name: String, timeout_ms: u64 },
@@ -51,8 +51,8 @@ impl DaemonError {
     pub fn code(&self) -> &'static str {
         match self {
             DaemonError::BotNotFound { .. } => "BOT_NOT_FOUND",
-            DaemonError::TeamNotFound { .. } => "TEAM_NOT_FOUND",
-            DaemonError::TeamPaused { .. } => "TEAM_PAUSED",
+            DaemonError::GroupNotFound { .. } => "GROUP_NOT_FOUND",
+            DaemonError::GroupPaused { .. } => "GROUP_PAUSED",
             DaemonError::InvalidRequest { .. } => "INVALID_REQUEST",
             DaemonError::ConcurrentLimit { .. } => "CONCURRENT_LIMIT",
             DaemonError::BotTimeout { .. } => "BOT_TIMEOUT",
@@ -67,8 +67,8 @@ impl DaemonError {
     pub fn http_status(&self) -> u16 {
         match self {
             DaemonError::BotNotFound { .. } => 404,
-            DaemonError::TeamNotFound { .. } => 404,
-            DaemonError::TeamPaused { .. } => 409,
+            DaemonError::GroupNotFound { .. } => 404,
+            DaemonError::GroupPaused { .. } => 409,
             DaemonError::InvalidRequest { .. } => 400,
             DaemonError::ConcurrentLimit { .. } => 429,
             DaemonError::BotTimeout { .. } => 504,
@@ -89,9 +89,9 @@ impl DaemonError {
                     format!("没有这个 BOT：{}（现有：{}）", name, available.join(", "))
                 }
             }
-            DaemonError::TeamNotFound { team_id } => format!("没有这个 Team：{}", team_id),
-            DaemonError::TeamPaused { team_id } => {
-                format!("Team `{}` 现在是暂停状态，先 resume 再来派活", team_id)
+            DaemonError::GroupNotFound { group_id } => format!("没有这个群：{}", group_id),
+            DaemonError::GroupPaused { group_id } => {
+                format!("群 `{}` 现在是暂停状态，先 resume 再来派活", group_id)
             }
             DaemonError::InvalidRequest { field, reason } => {
                 format!("参数 `{}` 不合法：{}", field, reason)
@@ -128,8 +128,8 @@ impl DaemonError {
             DaemonError::BotNotFound { name, available } => {
                 json!({ "name": name, "available": available })
             }
-            DaemonError::TeamNotFound { team_id } => json!({ "teamId": team_id }),
-            DaemonError::TeamPaused { team_id } => json!({ "teamId": team_id }),
+            DaemonError::GroupNotFound { group_id } => json!({ "groupId": group_id }),
+            DaemonError::GroupPaused { group_id } => json!({ "groupId": group_id }),
             DaemonError::InvalidRequest { field, reason } => {
                 json!({ "field": field, "reason": reason })
             }

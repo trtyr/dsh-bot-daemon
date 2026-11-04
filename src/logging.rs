@@ -18,7 +18,7 @@
 //! | --- | --- | --- |
 //! | ERROR | 这一件事失败了，且不是调用方的错 | 磁盘写不进去、BOT 启动失败 |
 //! | WARN | 能继续，但值得看一眼 | 并发已满拒绝了请求、BOT 超时被杀 |
-//! | INFO | 状态变化 | Team 建了、BOT 起停、请求处理完 |
+//! | INFO | 状态变化 | 群 建了、BOT 起停、请求处理完 |
 //! | DEBUG | 排障细节 | 解析到的事件、session 变更 |
 //! | TRACE | 逐行追踪 | 原始 JSON 行 |
 //!
@@ -30,7 +30,7 @@
 //! 一行一条，固定的「时间 级别 事件 字段…」顺序，人看得懂，机器也能 grep：
 //!
 //! ```text
-//! 2026-11-03T10:35:12Z INFO  bot.start      bot=sujianwei pid=93200 team=T-413ce528
+//! 2026-11-03T10:35:12Z INFO  bot.start      bot=sujianwei pid=93200 group=G-413ce528
 //! 2026-11-03T10:35:17Z INFO  bot.finish     bot=sujianwei ok=true ms=5132
 //! 2026-11-03T10:35:17Z WARN  bot.timeout    bot=zhongshiyu timeout_ms=300000
 //! ```
