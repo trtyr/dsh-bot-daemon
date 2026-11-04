@@ -55,7 +55,7 @@ fn display_name_from(agents_dir: &Path, bot: &str) -> Option<String> {
 /// 为什么需要：`agents_dir.join("钟诗雨")` 这个目录不存在，
 /// 于是调用方拿到 BOT_NOT_FOUND。实测苏见微 7 次调用里 4 次用了中文名，
 /// 每次都要先失败一次才知道该用 `zhongshiyu`。
-fn resolve_alias(agents_dir: &Path, name: &str) -> String {
+pub fn resolve_alias(agents_dir: &Path, name: &str) -> String {
     let direct = agents_dir.join(name);
     if direct.is_dir() {
         return name.to_string();

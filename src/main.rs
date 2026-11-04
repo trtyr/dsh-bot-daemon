@@ -624,6 +624,41 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     }
                 }
 
+                // D028 派活即入群：**在 spawn 之前**真写进 meta.json，两条路径都要过。
+                // 晚一步的话，BOT 干活时 group_whoami 看不见自己；
+                // 只写在同步路径上的话，async 永远不入群（实测抓到过）。
+                if let Some(gid) = &group_id {
+                    let store = {
+                        let s = lock(&state);
+                        GroupStore::new(s.groups.root.clone())
+                    };
+                    // 用解析后的目录名（钟诗雨 → zhongshiyu），跟 sessions/ 和 mailbox 对齐
+                    let member_name = bot::resolve_alias(&agents_dir, &name);
+                    if store.ensure_member(gid, &member_name, "worker") {
+                        store.append_event(
+                            gid,
+                            json!({
+                                "at": group::now_stamp(),
+                                "event": "member.joined",
+                                "group": gid,
+                                "bot": member_name,
+                                "why": "dispatched",
+                            }),
+                        );
+                    }
+                    store.append_event(
+                        gid,
+                        json!({
+                            "at": group::now_stamp(),
+                            "event": "task.dispatched",
+                            "group": gid,
+                            "job": if is_async { json!(job_id) } else { json!(null) },
+                            "bot": member_name,
+                            "from": sender,
+                        }),
+                    );
+                }
+
                 // ---- 异步分支：起线程跑，立刻返回 jobId（D019）----
                 if is_async {
                     let state_bg = state.clone();
@@ -686,19 +721,8 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                                 }
                             }
                         }
-                        if let Some(gid) = &gid_bg {
-                            groups_bg.append_event(
-                                gid,
-                                serde_json::json!({
-                                    "at": group::now_stamp(),
-                                    "event": if status == job::JobStatus::Done { "task.returned" } else { "task.failed" },
-                                    "group": gid,
-                                    "job": job_bg,
-                                    "bot": name_bg,
-                                    "mailbox": mailbox,
-                                }),
-                            );
-                        }
+                        // task.returned 由 bot::run 内部写（sync/async 共用一份），
+                        // 这里只更新 job 表，不重复记事件。
                     });
                     api::ok(
                         request,
@@ -718,33 +742,6 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     GroupStore::new(s.groups.root.clone())
                 };
 
-                // D028 派活即入群：**在 spawn 之前**真写进 meta.json。
-                // 晚一步的话，BOT 干活时 group_whoami 看不见自己。
-                if let Some(gid) = &group_id {
-                    if groups.ensure_member(gid, &name, "worker") {
-                        groups.append_event(
-                            gid,
-                            json!({
-                                "at": group::now_stamp(),
-                                "event": "member.joined",
-                                "group": gid,
-                                "bot": name,
-                                "why": "dispatched",
-                            }),
-                        );
-                    }
-                    groups.append_event(
-                        gid,
-                        json!({
-                            "at": group::now_stamp(),
-                            "event": "task.dispatched",
-                            "group": gid,
-                            "job": if is_async { json!(job_id) } else { json!(null) },
-                            "bot": name,
-                            "from": sender,
-                        }),
-                    );
-                }
 
                 let state_for_pid = state.clone();
                 let key_for_pid = key.clone();
