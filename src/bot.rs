@@ -142,11 +142,37 @@ pub fn run(
     //
     // 这不是环境变量、也不是配置文件 —— 是**调用现场的事实**：
     // 谁发起的、属于哪个 Team，由 daemon 从 PID 反查得到，写在这一句里。
-    let header = match (sender, group_id) {
-        (Some(from), Some(team)) => format!("[来自 {} · 群 {}]\n", from, team),
-        (Some(from), None) => format!("[来自 {}]\n", from),
-        (None, Some(team)) => format!("[群 {}]\n", team),
-        (None, None) => String::new(),
+    // 群工作区的**绝对路径**——必须写进消息头。
+    //
+    // 为什么：BOT 的 cwd 是 `~/.dsh/agents/<bot>/`（人设在那，dsh 靠 cwd 找 AGENTS.md）。
+    // 任务书里写「workspace/deliverables/x.md」这种相对路径，它会老老实实写进
+    // `agents/<bot>/workspace/deliverables/` —— **群的工作区从头到尾没被用过**
+    // （实测抓到：钟诗雨说 done，群目录里没有那个文件，文件在它自己家）。
+    let workspace = group_id.map(|gid| {
+        let root = std::env::var("DSH_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".dsh")
+            });
+        root.join("groups").join(gid).join("workspace")
+    });
+
+    let header = match (sender, group_id, &workspace) {
+        (Some(from), Some(team), Some(ws)) => format!(
+            "[来自 {} · 群 {}]\n[群工作区（绝对路径，交付物写这里）：{}]\n",
+            from,
+            team,
+            ws.display()
+        ),
+        (Some(from), Some(team), None) => format!("[来自 {} · 群 {}]\n", from, team),
+        (Some(from), None, _) => format!("[来自 {}]\n", from),
+        (None, Some(team), Some(ws)) => format!(
+            "[群 {}]\n[群工作区（绝对路径，交付物写这里）：{}]\n",
+            team,
+            ws.display()
+        ),
+        (None, Some(team), None) => format!("[群 {}]\n", team),
+        (None, None, _) => String::new(),
     };
 
     let full_message = match &memory_note {
