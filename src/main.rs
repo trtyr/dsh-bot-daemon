@@ -257,7 +257,7 @@ fn main() {
     let default_timeout_ms: u64 = env::var("DSH_BOT_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(300_000);
+        .unwrap_or(0);
 
     let agents_dir = PathBuf::from(format!("{}/agents", dsh_home));
     let groups_root = PathBuf::from(format!("{}/groups", dsh_home));

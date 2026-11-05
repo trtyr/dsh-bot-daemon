@@ -221,6 +221,10 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // timeout_ms == 0 表示**不限**：活跑多久算多久。
+    // 之前默认 5 分钟，实测真实项目（npm run dev + 写代码）必被掐，
+    // 掐的时候 replyChars=0——活干了，结果一个字拿不回来。
+    let limited = timeout_ms > 0;
     let started = Instant::now();
     let mut child: Child = cmd.spawn().map_err(|e| {
         log_error!("bot.spawn_failed", bot = name, error = &e);
@@ -274,12 +278,17 @@ pub fn run(
         let deadline = started + Duration::from_millis(timeout_ms);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            // 不限时（limited=false）永远不进这个分支
+            if limited && remaining.is_zero() {
                 timed_out = true;
                 let _ = child.kill();
                 break;
             }
-            let line = match rx.recv_timeout(remaining) {
+            let line = match if limited {
+                rx.recv_timeout(remaining)
+            } else {
+                rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } {
                 Ok(Ok(l)) => l,
                 Ok(Err(_)) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -352,7 +361,7 @@ pub fn run(
         );
     }
 
-    if timed_out || final_text.is_none() && ms >= timeout_ms {
+    if timed_out || (limited && final_text.is_none() && ms >= timeout_ms) {
         log_warn!("bot.timeout", bot = name, timeout_ms = timeout_ms, ms = ms);
         return Err(DaemonError::BotTimeout {
             name: name.to_string(),
