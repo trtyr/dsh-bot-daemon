@@ -77,6 +77,26 @@ pub struct State {
 
 pub type Shared = Arc<Mutex<State>>;
 
+/// 这个 pid 还活着吗。
+///
+/// `kill(pid, 0)` 只做权限/存在性检查，不发信号——这是 POSIX 上判断存活的标准做法。
+/// macOS / Linux / WSL 都支持；Windows 走不着这条（那边另有实现）。
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid == 1 {
+        return true; // 0/1 是内核，永远"活着"，别误判成父进程死了
+    }
+    // 用 `kill -0` 探活：不发信号，只做存在性/权限检查。
+    // 不引 libc 依赖——daemon 刻意保持零三方依赖。
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// 拿锁，中毒也能继续（不让一次 panic 拖死整个 daemon）。
 fn lock(state: &Shared) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -127,7 +147,14 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
-    // 空闲多久自动退（D032）。0 = 不退（调试用）。
+    // 拉起我的那个 dsh 进程（D032 修正：父走子走）。
+    // 没设就说明是手动启动的（调试 / curl 直连），不做父进程检查。
+    let parent_pid: Option<u32> = env::var("DSH_BOT_PARENT_PID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|p| *p > 0);
+
+    // 空闲多久自动退（兜底）。0 = 不退（调试用）。
     let idle_timeout_secs: u64 = env::var("DSH_BOT_IDLE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -178,7 +205,22 @@ fn main() {
     // 实测：苏见微调钟诗雨时嵌套两次推理，/groups 直接超时。
     //
     // 并发上限由 max_concurrent 控（/run 里检查），不是靠串行控。
-    // 空闲退出（D032「谁用谁拉」的另一半）：没人用了就退，别常驻占资源。
+    // 父走子走（D032 修正）。
+    //
+    // 用户原话：「dsh 关了之后后台还在，这肯定是不正常的」——对，daemon 是我拉起来的，
+    // 我用完它就该收，不是"闲置 30 分钟看看还有没有人来"。macOS 没有 PDEATHSIG，
+    // 只能轮询问「拉起我的那个进程还在吗」。
+    if let Some(ppid) = parent_pid {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(3));
+            if !process_alive(ppid) {
+                log_info!("daemon.parent_gone", parent_pid = ppid);
+                std::process::exit(0);
+            }
+        });
+    }
+
+    // 空闲退出（兜底）：手动启动、没有父进程时才靠它。
     // 有活干（running 或 jobs 里有 Running）就不退。
     {
         let idle_state = state.clone();
