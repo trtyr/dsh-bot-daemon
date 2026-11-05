@@ -75,6 +75,60 @@ pub struct State {
     pub last_active: Instant,
 }
 
+/// 从 mailbox 重建 job 表（D019 的「双写」只做了写，没做重建）。
+///
+/// 为什么必须有：job 表是内存的，daemon 一重启就空。实测在会话里表现为
+/// `bot_poll(job-xxx) → 没有这个 job`——**结果文件明明还在磁盘上**。
+///
+/// 只重建 done 的（失败没有 mailbox）。frontmatter 里 `job:` / `bot:` / `at:` 够用了。
+fn rebuild_jobs_from_mailbox(groups_root: &std::path::Path) -> HashMap<String, job::Job> {
+    let mut out: HashMap<String, job::Job> = HashMap::new();
+    let Ok(groups) = std::fs::read_dir(groups_root) else {
+        return out;
+    };
+    for g in groups.flatten() {
+        let gid = g.file_name().to_string_lossy().to_string();
+        let mailbox = g.path().join("workspace").join("mailbox");
+        let Ok(files) = std::fs::read_dir(&mailbox) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // frontmatter：--- 之间，形如 `job: job-xxx`
+            let mut job_id = None;
+            let mut bot = None;
+            for line in text.lines().take(10) {
+                if let Some(v) = line.strip_prefix("job: ") {
+                    job_id = Some(v.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("bot: ") {
+                    bot = Some(v.trim().to_string());
+                }
+            }
+            let (Some(jid), Some(b)) = (job_id, bot) else {
+                continue;
+            };
+            let mut j = job::Job::new(jid.clone(), b, Some(gid.clone()), None, None, "terminate".into());
+            j.status = job::JobStatus::Done;
+            j.mailbox = Some(format!(
+                "workspace/mailbox/{}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            j.finished = Some(Instant::now());
+            out.insert(jid, j);
+        }
+    }
+    if !out.is_empty() {
+        log_info!("jobs.rebuilt", count = out.len());
+    }
+    out
+}
+
 /// 关一个 BOT：**先礼后兵，杀的是整组不是单个 pid**。
 ///
 /// 1. 先 SIGTERM 整个进程组，给它收尾的机会
@@ -229,7 +283,7 @@ fn main() {
 
     let state: Shared = Arc::new(Mutex::new(State {
         running: HashMap::new(),
-        jobs: HashMap::new(),
+        jobs: rebuild_jobs_from_mailbox(&groups_root),
         last_active: Instant::now(),
         started_at: Instant::now(),
         agents_dir,

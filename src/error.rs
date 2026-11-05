@@ -41,8 +41,8 @@ pub enum DaemonError {
     GroupPaused { group_id: String },
     InvalidRequest { field: &'static str, reason: String },
     ConcurrentLimit { max: usize, current: usize },
-    BotTimeout { name: String, timeout_ms: u64 },
-    BotNoAnswer { name: String, exit_code: Option<i32>, stderr_tail: String },
+    BotTimeout { name: String, timeout_ms: u64, partial: String },
+    BotNoAnswer { name: String, exit_code: Option<i32>, stderr_tail: String, partial: String },
     SpawnFailed { name: String, reason: String },
     IoFailed { context: &'static str, reason: String },
     Internal { context: &'static str, reason: String },
@@ -107,16 +107,31 @@ impl DaemonError {
             DaemonError::ConcurrentLimit { max, current } => {
                 format!("并发已满（{} 个在跑，上限 {}），等一会儿再试", current, max)
             }
-            DaemonError::BotTimeout { name, timeout_ms } => {
-                format!("BOT `{}` 超过 {} ms 还没答完，已中止", name, timeout_ms)
+            DaemonError::BotTimeout { name, timeout_ms, partial } => {
+                // 把半截话带出来：BOT 卡住前往往已经说了「做到哪一步」，
+                // 那比一句「超时」有用得多。
+                let said = if partial.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("；它最后说的话：{}", partial)
+                };
+                format!("BOT `{}` 超过 {} ms 还没答完，已中止{}", name, timeout_ms, said)
             }
-            DaemonError::BotNoAnswer { name, exit_code, stderr_tail } => {
+            DaemonError::BotNoAnswer { name, exit_code, stderr_tail, partial } => {
                 let tail = if stderr_tail.is_empty() {
                     String::new()
                 } else {
                     format!("；stderr 尾部：{}", stderr_tail)
                 };
-                format!("BOT `{}` 没有给出最终答案（退出码 {:?}）{}", name, exit_code, tail)
+                let said = if partial.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("；它最后说的话：{}", partial)
+                };
+                format!(
+                    "BOT `{}` 没有给出最终答案（退出码 {:?}）{}{}",
+                    name, exit_code, tail, said
+                )
             }
             DaemonError::SpawnFailed { name, reason } => {
                 format!("拉不起 BOT `{}`：{}", name, reason)
@@ -146,10 +161,10 @@ impl DaemonError {
             DaemonError::ConcurrentLimit { max, current } => {
                 json!({ "max": max, "current": current })
             }
-            DaemonError::BotTimeout { name, timeout_ms } => {
+            DaemonError::BotTimeout { name, timeout_ms, .. } => {
                 json!({ "name": name, "timeoutMs": timeout_ms })
             }
-            DaemonError::BotNoAnswer { name, exit_code, stderr_tail } => json!({
+            DaemonError::BotNoAnswer { name, exit_code, stderr_tail, .. } => json!({
                 "name": name,
                 "exitCode": exit_code,
                 "stderrTail": stderr_tail,

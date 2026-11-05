@@ -251,6 +251,9 @@ pub fn run(
 
     let mut session_id: Option<String> = None;
     let mut final_text: Option<String> = None;
+    // 半截话：BOT 说过但没走到 final 的内容。失败时这个比错误码有用得多——
+    // 实测用户看到「failed 但回执是空的」会以为系统坏了，其实 BOT 说了「做到一半停住了」。
+    let mut partial_text = String::new();
     let mut timed_out = false;
 
     if let Some(out) = child.stdout.take() {
@@ -303,6 +306,17 @@ pub fn run(
                             final_text = Some(txt.to_string());
                         }
                     }
+                    Some("assistant") => {
+                        // --json 的 assistant 事件：只累积真正的 text，reasoning 不收
+                        if let Some(txt) = evt.get("text").and_then(|v| v.as_str()) {
+                            if !txt.trim().is_empty() {
+                                if !partial_text.is_empty() {
+                                    partial_text.push('\n');
+                                }
+                                partial_text.push_str(txt);
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Err(e) => log_debug!("bot.event_parse_failed", bot = name, error = e, raw = trimmed),
@@ -342,6 +356,7 @@ pub fn run(
         return Err(DaemonError::BotTimeout {
             name: name.to_string(),
             timeout_ms,
+            partial: partial_text.chars().take(2000).collect(),
         });
     }
 
@@ -372,6 +387,7 @@ pub fn run(
                 name: name.to_string(),
                 exit_code: status.and_then(|s| s.code()),
                 stderr_tail: tail_str,
+                partial: partial_text.chars().take(2000).collect(),
             })
         }
     }
