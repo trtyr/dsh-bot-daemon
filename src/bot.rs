@@ -306,8 +306,9 @@ pub fn run(
                             final_text = Some(txt.to_string());
                         }
                     }
-                    Some("assistant") => {
-                        // --json 的 assistant 事件：只累积真正的 text，reasoning 不收
+                    Some("text") => {
+                        // dsh --json 的真实事件名是 `text`（不是 assistant）。
+                        // 实测格式：{"type":"text","text":"收到"}
                         if let Some(txt) = evt.get("text").and_then(|v| v.as_str()) {
                             if !txt.trim().is_empty() {
                                 if !partial_text.is_empty() {
