@@ -594,6 +594,14 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(timeout_default);
 
+                // D018 三字段：插件会传过来，记进群史供 L4 团队层审（sa_team.py 的 T2）
+                let stage = body.get("stage").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let deliverable = body
+                    .get("deliverable")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let accept = body.get("accept").and_then(|v| v.as_str()).map(|s| s.to_string());
+
                 let is_async = body
                     .get("async")
                     .and_then(|v| v.as_bool())
@@ -655,6 +663,9 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             "job": if is_async { json!(job_id) } else { json!(null) },
                             "bot": member_name,
                             "from": sender,
+                            "stage": stage,
+                            "deliverable": deliverable,
+                            "accept": accept,
                         }),
                     );
                 }
