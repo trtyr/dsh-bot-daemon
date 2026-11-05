@@ -644,6 +644,23 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     );
                     return;
                 }
+                // P13：业务级长度上限。60K 字符 ≈ 几万 token，一个手滑就烧掉一整轮预算。
+                // 大材料应该落文件、消息里给路径（AF-1 指针 + 作业本）。
+                const MESSAGE_LIMIT: usize = 16_384;
+                if message.chars().count() > MESSAGE_LIMIT {
+                    api::fail(
+                        request,
+                        &DaemonError::InvalidRequest {
+                            field: "message",
+                            reason: format!(
+                                "太长（{} 字符，上限 {}）。大材料请落成文件，消息里只给路径",
+                                message.chars().count(),
+                                MESSAGE_LIMIT
+                            ),
+                        },
+                    );
+                    return;
+                }
 
                 // ---- 身份：优先用 PID 反查，其次用显式 groupId ----
                 //
@@ -809,6 +826,39 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                 // 登记为运行中
                 let key = format!("{}:{}", group_id.as_deref().unwrap_or("default"), name);
                 let job_id = job::new_job_id();
+
+                // ---- 同一 BOT 重入保护（T006 / P9）----
+                //
+                // 两个进程拿同一个 --session-id 会抢 session 文件的写句柄，
+                // 实测第二个直接 failed（`session ... is already owned by an active write handle`）。
+                // **这是数据损坏，不是资源上限**（D023 取消的是并发名额，不是这个）。
+                //
+                // 做法：排队。等前一个跑完再插，最多等到调用方的 timeout。
+                {
+                    let wait_until = Instant::now() + Duration::from_millis(timeout_ms.min(120_000));
+                    loop {
+                        let busy = {
+                            let s = lock(&state);
+                            s.running.contains_key(&key)
+                        };
+                        if !busy || Instant::now() > wait_until {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    let still_busy = {
+                        let s = lock(&state);
+                        s.running.contains_key(&key)
+                    };
+                    if still_busy {
+                        api::fail(
+                            request,
+                            &DaemonError::BotBusy { name: name.clone() },
+                        );
+                        return;
+                    }
+                }
+
                 {
                     let mut s = lock(&state);
                     s.running.insert(key.clone(), (0, Instant::now()));
@@ -920,11 +970,16 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             if let Ok(mut s) = state_bg.lock() {
                                 s.running.remove(&key_bg);
                                 if let Some(j) = s.jobs.get_mut(&job_bg) {
-                                    j.status = status;
-                                    j.reply = reply;
-                                    j.error = err;
-                                    j.finished = Some(Instant::now());
-                                    j.mailbox = mailbox.clone();
+                                    // 别覆盖已经被 /stop 标成 Failed 的（P11 的竞态）：
+                                    // 进程被杀 → 读循环正常结束 → 线程会走 Ok 分支想标 Done，
+                                    // 那会把「被停掉」美化成「干完了」。
+                                    if j.status == job::JobStatus::Running {
+                                        j.status = status;
+                                        j.reply = reply;
+                                        j.error = err;
+                                        j.finished = Some(Instant::now());
+                                        j.mailbox = mailbox.clone();
+                                    }
                                 }
                             }
                         }
@@ -1062,6 +1117,16 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             }
                         }
                         s.running.remove(&k);
+                        // P11：被停掉的活要把 job 标成 failed——
+                        // 原来是 done（因为进程退出被读成"正常结束"），调用方会以为活干完了。
+                        let (_, bot) = k.split_once(':').unwrap_or(("", ""));
+                        for j in s.jobs.values_mut() {
+                            if j.bot == bot && j.status == job::JobStatus::Running {
+                                j.status = job::JobStatus::Failed;
+                                j.error = Some("被 /stop 停掉".to_string());
+                                j.finished = Some(Instant::now());
+                            }
+                        }
                     }
                 }
                 log_warn!("bot.stopped_by_request", count = stopped);

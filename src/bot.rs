@@ -246,15 +246,38 @@ pub fn run(
     let mut timed_out = false;
 
     if let Some(out) = child.stdout.take() {
-        let reader = BufReader::new(out);
+        // 读线程 + channel：**这是超时能生效的前提**。
+        //
+        // 原来直接 `for line in reader.lines()`——BOT 不吐字时那个调用会一直阻塞，
+        // 循环里的 `Instant::now() > deadline` 永远轮不到执行。实测 timeoutMs=8000
+        // 的活跑到 30 秒才结束（是 BOT 自己跑完，不是被掐的）。
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(out);
+            for line in reader.lines() {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
         let deadline = started + Duration::from_millis(timeout_ms);
-        for line in reader.lines() {
-            if Instant::now() > deadline {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 timed_out = true;
                 let _ = child.kill();
                 break;
             }
-            let Ok(line) = line else { break };
+            let line = match rx.recv_timeout(remaining) {
+                Ok(Ok(l)) => l,
+                Ok(Err(_)) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let trimmed = line.trim();
             if !trimmed.starts_with('{') {
                 continue;

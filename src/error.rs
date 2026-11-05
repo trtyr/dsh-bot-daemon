@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 pub enum DaemonError {
     BotNotFound { name: String, available: Vec<String> },
     JobNotFound { job_id: String },
+    BotBusy { name: String },
     GroupNotFound { group_id: String },
     GroupPaused { group_id: String },
     InvalidRequest { field: &'static str, reason: String },
@@ -53,6 +54,7 @@ impl DaemonError {
         match self {
             DaemonError::BotNotFound { .. } => "BOT_NOT_FOUND",
             DaemonError::JobNotFound { .. } => "JOB_NOT_FOUND",
+            DaemonError::BotBusy { .. } => "BOT_BUSY",
             DaemonError::GroupNotFound { .. } => "GROUP_NOT_FOUND",
             DaemonError::GroupPaused { .. } => "GROUP_PAUSED",
             DaemonError::InvalidRequest { .. } => "INVALID_REQUEST",
@@ -70,6 +72,7 @@ impl DaemonError {
         match self {
             DaemonError::BotNotFound { .. } => 404,
             DaemonError::JobNotFound { .. } => 404,
+            DaemonError::BotBusy { .. } => 409,
             DaemonError::GroupNotFound { .. } => 404,
             DaemonError::GroupPaused { .. } => 409,
             DaemonError::InvalidRequest { .. } => 400,
@@ -94,6 +97,7 @@ impl DaemonError {
             }
             DaemonError::GroupNotFound { group_id } => format!("没有这个群：{}", group_id),
             DaemonError::JobNotFound { job_id } => format!("没有这个 job：{}", job_id),
+            DaemonError::BotBusy { name } => format!("BOT `{}` 还在跑上一个活，等它完再来", name),
             DaemonError::GroupPaused { group_id } => {
                 format!("群 `{}` 现在是暂停状态，先 resume 再来派活", group_id)
             }
@@ -134,6 +138,7 @@ impl DaemonError {
             }
             DaemonError::GroupNotFound { group_id } => json!({ "groupId": group_id }),
             DaemonError::JobNotFound { job_id } => json!({ "jobId": job_id }),
+            DaemonError::BotBusy { name } => json!({ "name": name }),
             DaemonError::GroupPaused { group_id } => json!({ "groupId": group_id }),
             DaemonError::InvalidRequest { field, reason } => {
                 json!({ "field": field, "reason": reason })
