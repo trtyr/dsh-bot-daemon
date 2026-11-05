@@ -966,6 +966,26 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             }
                             Err(e) => (job::JobStatus::Failed, None, Some(format!("{e}")), None),
                         };
+                        // 唤醒主会话：子任务跑完了，不该等用户开口才知道。
+                        // 只有 async 分支需要——同步的调用方本来就在等。
+                        // 放在 job 表更新之前：那里会把 reply/err move 走。
+                        if let Some(gid) = &gid_bg {
+                            let head: String = reply
+                                .as_deref()
+                                .or(err.as_deref())
+                                .unwrap_or("")
+                                .chars()
+                                .take(500)
+                                .collect();
+                            let text = format!(
+                                "【子任务完成】{} · {}\n{}\n\n（回执在 mailbox；要全文用 bot_inbox 或 bot_poll）",
+                                name_bg,
+                                if status == job::JobStatus::Done { "已完成" } else { "失败" },
+                                if head.is_empty() { "（无输出）".to_string() } else { head },
+                            );
+                            group::wake_origin(&groups_bg.root, gid, &text);
+                        }
+
                         {
                             if let Ok(mut s) = state_bg.lock() {
                                 s.running.remove(&key_bg);

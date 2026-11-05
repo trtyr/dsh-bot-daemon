@@ -636,3 +636,76 @@ pub fn now_stamp() -> String {
         .unwrap_or(0);
     format!("epoch:{}", secs)
 }
+
+// ── 唤醒通道（daemon → 主会话）────────────────────────────────────────
+//
+// 子任务跑完了，主会话不该等用户说话才知道。插件在 `~/.dsh/run/wake-<pid>.sock`
+// 上监听，登记在 `~/.dsh/registry/wake/<sessionId>.json`。
+// 这里：groupId → meta.originSession → 查登记 → 连 socket → 送一行 JSON。
+//
+// **用 socket 不用端口**：同机可能开好几个 dsh，写死端口第 2 个实例就 bind 失败；
+// socket 的路径本身就是唯一标识。
+
+#[cfg(unix)]
+pub fn wake_origin(root: &Path, group_id: &str, text: &str) -> bool {
+    let dir_of = |gid: &str| root.join(gid);
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let meta_path = dir_of(group_id).join("meta.json");
+    let Ok(raw) = fs::read_to_string(&meta_path) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Some(session_id) = meta
+        .get("originSession")
+        .and_then(|o| o.get("id"))
+        .and_then(|v| v.as_str())
+    else {
+        return false;
+    };
+
+    let home = std::env::var("DSH_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.dsh",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let reg = std::path::PathBuf::from(&home)
+        .join("registry")
+        .join("wake")
+        .join(format!("{}.json", session_id));
+    let Ok(reg_raw) = fs::read_to_string(&reg) else {
+        log_debug!("wake.no_register", session = session_id);
+        return false;
+    };
+    let Ok(reg_json) = serde_json::from_str::<Value>(&reg_raw) else {
+        return false;
+    };
+    let Some(sock) = reg_json.get("sock").and_then(|v| v.as_str()) else {
+        return false;
+    };
+
+    let payload = serde_json::json!({ "text": text }).to_string();
+    match UnixStream::connect(sock) {
+        Ok(mut stream) => {
+            let _ = stream.write_all(format!("{}\n", payload).as_bytes());
+            let _ = stream.flush();
+            log_info!("wake.sent", group = group_id, session = session_id);
+            true
+        }
+        Err(e) => {
+            // 连不上通常是那个实例已经退出了——顺手把陈旧登记清掉
+            log_debug!("wake.connect_failed", sock = sock, error = e);
+            let _ = fs::remove_file(&reg);
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn wake_origin(_root: &Path, _group_id: &str, _text: &str) -> bool {
+    false
+}
