@@ -109,6 +109,9 @@ pub fn run(
     message: &str,
     group_id: Option<&str>,
     sender: Option<&str>,
+    // D027：这条调用链（逗号分隔）；下游再派活要接着往下带
+    chain: Option<&str>,
+    job_id: Option<&str>,
     timeout_ms: u64,
     // spawn 成功后立刻回报真实 PID —— 身份反查要靠它，不能是 0
     on_spawn: &dyn Fn(u32),
@@ -194,6 +197,14 @@ pub fn run(
     }
     if let Some(from) = sender {
         cmd.env("DSH_BOT_SENDER", from);
+    }
+    // 链带下去：BOT 再派活时插件会读它、拼上自己、传给 daemon
+    if let Some(c) = chain {
+        cmd.env("DSH_BOT_CHAIN", c);
+    }
+    // BOT 自己跑在哪个 job 里——它再派活时插件拿它当 parentJob（D019）
+    if let Some(j) = job_id {
+        cmd.env("DSH_BOT_JOB_ID", j);
     }
     cmd.env("DSH_BOT_NAME", name);
 

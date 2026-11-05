@@ -364,6 +364,37 @@ impl GroupStore {
         }
     }
 
+    /// 长回执落盘（long-reply-fallback.md）：超过阈值的回执全文写 `workspace/replies/`。
+    ///
+    /// 为什么不是防截断：实测 daemon/插件都不截断（3892 字符完整回来）。
+    /// 落盘是为了防**上下文被撑爆**——三万字的回执塞进主会话就完了。
+    pub fn write_reply(&self, group_id: &str, run_id: &str, bot: &str, reply: &str) -> Option<String> {
+        let rel = format!("workspace/replies/{}-{}.md", run_id, bot);
+        let path = self.dir(group_id).join(&rel);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                log_error!("reply.mkdir_failed", path = &parent.display(), error = e);
+                return None;
+            }
+        }
+        let body = format!(
+            "---\nrun: {run_id}\nbot: {bot}\ngroup: {group_id}\nchars: {chars}\nat: {at}\n---\n\n{reply}\n",
+            run_id = run_id,
+            bot = bot,
+            group_id = group_id,
+            chars = reply.chars().count(),
+            at = now_stamp(),
+            reply = reply,
+        );
+        match atomic_write(&path, &body) {
+            Ok(_) => Some(rel),
+            Err(e) => {
+                log_error!("reply.write_failed", path = &path.display(), error = e);
+                None
+            }
+        }
+    }
+
     /// 把异步 job 的结果写进信箱（D019）。
     ///
     /// 路径：`groups/<id>/workspace/mailbox/<jobId>-<bot>.md`，返回**相对群目录**的路径。
@@ -432,6 +463,18 @@ impl GroupStore {
             }
             Err(e) => log_error!("group.event_open_failed", path = &path.display(), error = e),
         }
+    }
+
+    /// 这个群归档了吗（D026：archived 状态下任何人都不该能派活）。
+    pub fn is_archived(&self, group_id: &str) -> bool {
+        let meta_path = self.dir(group_id).join("meta.json");
+        let Ok(raw) = fs::read_to_string(meta_path) else {
+            return false;
+        };
+        let Ok(meta) = serde_json::from_str::<Value>(&raw) else {
+            return false;
+        };
+        meta.get("archivedAt").map(|v| !v.is_null()).unwrap_or(false)
     }
 
     /// 这个 群 暂停了吗。

@@ -417,10 +417,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     Some(v) => api::ok(request, v),
                     None => api::fail(
                         request,
-                        &DaemonError::InvalidRequest {
-                            field: "jobId",
-                            reason: format!("没有这个 job：{}", id),
-                        },
+                        &DaemonError::JobNotFound { job_id: id },
                     ),
                 }
             }
@@ -692,6 +689,20 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                         return;
                     }
                     // 暂停的 群 拒绝派活（D001 的「暂停」在这里生效）
+                    // D026：归档的群一律不让派活（原来只查了 paused，漏了这个）
+                    let archived = {
+                        let s = lock(&state);
+                        s.groups.is_archived(tid)
+                    };
+                    if archived {
+                        api::fail(
+                            request,
+                            &DaemonError::GroupPaused {
+                                group_id: tid.clone(),
+                            },
+                        );
+                        return;
+                    }
                     let paused = {
                         let s = lock(&state);
                         s.groups.is_paused(tid)
@@ -727,6 +738,63 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     .map(|s| s.to_string());
                 let accept = body.get("accept").and_then(|v| v.as_str()).map(|s| s.to_string());
 
+                // ---- D027 机制 2/3：调用链 + 深度上限 ----
+                //
+                // chain 是逗号分隔的 bot 名，由调用方（插件）带下来。
+                // 判据两条：
+                //   1. 链上已经有目标 bot → 成环，拒
+                //   2. 链长度 >= 3 → 太深，拒
+                // 超限不是重试，是升级（返回错误让调用方去问人）。
+                let chain_raw = body
+                    .get("chain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let chain: Vec<String> = chain_raw
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                if chain.iter().any(|c| c == &name) {
+                    api::fail(
+                        request,
+                        &DaemonError::InvalidRequest {
+                            field: "chain",
+                            reason: format!(
+                                "成环：{} 已经在调用链上（{}）。A→B 的链上不能再出现 A",
+                                name,
+                                chain.join("→")
+                            ),
+                        },
+                    );
+                    return;
+                }
+                if chain.len() >= 3 {
+                    api::fail(
+                        request,
+                        &DaemonError::InvalidRequest {
+                            field: "chain",
+                            reason: format!(
+                                "太深：链长 {}（上限 3）。该升级给群主，不是继续往下派",
+                                chain.len()
+                            ),
+                        },
+                    );
+                    return;
+                }
+
+                // 我这条链（加上自己）——传给被派的 BOT，它再派就带下去
+                let next_chain = {
+                    let mut v = chain.clone();
+                    v.push(name.clone());
+                    v.join(",")
+                };
+                let parent_job = body
+                    .get("parentJob")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
                 let is_async = body
                     .get("async")
                     .and_then(|v| v.as_bool())
@@ -749,7 +817,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             job_id.clone(),
                             name.clone(),
                             group_id.clone(),
-                            None,                 // parent_job 留空：PID 反查父 job 待补
+                            parent_job.clone(),
                             sender.clone(),
                             on_parent_close.clone(),
                         );
@@ -809,6 +877,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     let message_bg = message.clone();
                     let gid_bg = group_id.clone();
                     let sender_bg = sender.clone();
+                    let chain_bg = next_chain.clone();
                     std::thread::spawn(move || {
                         let state_for_pid = state_bg.clone();
                         let key_for_pid = key_bg.clone();
@@ -820,6 +889,8 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             &message_bg,
                             gid_bg.as_deref(),
                             sender_bg.as_deref(),
+                            Some(&chain_bg),
+                            Some(&job_bg),
                             timeout_ms,
                             &move |real_pid: u32| {
                                 if let Ok(mut s) = state_for_pid.lock() {
@@ -888,6 +959,8 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     &message,
                     group_id.as_deref(),
                     sender.as_deref(),
+                    Some(&next_chain),
+                    None, // 同步调用没有 job
                     timeout_ms,
                     &move |real_pid: u32| {
                         // 回填真实 PID —— 这是 PID 反查的唯一依据
@@ -907,6 +980,10 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
 
                 match result {
                     Ok(outcome) => {
+                        // 长回执兜底：超阈值就落盘，只回前 2000 字 + 路径。
+                        // 阈值 2000 不是拍脑袋：实测一次正常任务回执约 1900 字。
+                        const REPLY_LIMIT: usize = 2000;
+                        let chars = outcome.reply.chars().count();
                         let mut data = json!({
                             "reply": outcome.reply,
                             "sessionId": outcome.session_id,
@@ -914,6 +991,20 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                             "ms": outcome.ms,
                             "continued": outcome.continued,
                         });
+                        if chars > REPLY_LIMIT {
+                            if let Some(gid) = &group_id {
+                                let run_id = format!("run-{}", &job_id.replace("job-", ""));
+                                if let Some(rel) =
+                                    groups.write_reply(gid, &run_id, &outcome.bot, &outcome.reply)
+                                {
+                                    let head: String = outcome.reply.chars().take(REPLY_LIMIT).collect();
+                                    data["reply"] = json!(head);
+                                    data["replyTruncated"] = json!(true);
+                                    data["replyChars"] = json!(chars);
+                                    data["replyPath"] = json!(rel);
+                                }
+                            }
+                        }
                         if let Some(tid) = &group_id {
                             data["groupId"] = json!(tid);
                         }
