@@ -208,6 +208,14 @@ pub fn run(
     }
     cmd.env("DSH_BOT_NAME", name);
 
+    // 独立进程组：dsh 自己会起子进程，杀父不杀子就是孤儿进程。
+    // 杀了整组（kill -pgid）才叫真关死。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     cmd.current_dir(&agent_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

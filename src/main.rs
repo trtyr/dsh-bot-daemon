@@ -75,6 +75,46 @@ pub struct State {
     pub last_active: Instant,
 }
 
+/// 关一个 BOT：**先礼后兵，杀的是整组不是单个 pid**。
+///
+/// 1. 先 SIGTERM 整个进程组，给它收尾的机会
+/// 2. 3 秒还不退 → SIGKILL 整个进程组
+/// 3. `force: true` 直接跳到第 2 步
+///
+/// 为什么是进程组：`dsh` 自己会起 node 子进程，只杀父进程会留下孤儿——
+/// 那才是「看着关了其实没关」的真正来源。spawn 时已经 `process_group(0)`。
+fn stop_process_tree(pid: u32, force: bool) {
+    let pgid = pid; // process_group(0) 让 pgid == pid
+    if !force {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(format!("-{}", pgid))
+            .status();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            let alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(format!("-{}", pgid))
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
+        }
+    }
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{}", pgid))
+        .status();
+    // 单 pid 兜底（万一它自己换了组）
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status();
+}
+
 pub type Shared = Arc<Mutex<State>>;
 
 /// 这个 pid 还活着吗。
@@ -1116,6 +1156,10 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
             (Method::Post, "/stop") => {
                 let body = read_body(&mut request);
                 let only = body.get("name").and_then(|v| v.as_str());
+                let force = body
+                    .get("force")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let mut stopped = 0u32;
                 {
                     let mut s = lock(&state);
@@ -1130,9 +1174,7 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                     for k in keys {
                         if let Some((pid, _)) = s.running.get(&k) {
                             if *pid > 0 {
-                                let _ = std::process::Command::new("kill")
-                                    .arg(pid.to_string())
-                                    .status();
+                                stop_process_tree(*pid, force);
                                 stopped += 1;
                             }
                         }
