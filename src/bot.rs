@@ -208,6 +208,28 @@ pub fn run(
     }
     cmd.env("DSH_BOT_NAME", name);
 
+    // ── 洗环境：开发态污染不许带进 BOT ─────────────────────────
+    //
+    // 实测事故：本机 shell 里 `NODE_ENV=production`，一路继承到 daemon 再继承到 BOT，
+    // 苏延柔跑 `npm install` 时 npm 静默 `omit=dev`，**跳过了所有 devDependencies**，
+    // 回一句「up to date in 262ms」——一个错都不报。
+    // 结果 vite / tailwindcss / typescript 一个都没装上，项目看着装好了、其实起不来。
+    //
+    // BOT 是「干活的人」，它的环境必须干净：开发工具要能装、要能跑。
+    // 只用白名单不够（npm/node 的变量太多），所以按黑名单洗掉已知的污染源。
+    for poisoned in [
+        "NODE_ENV",          // 最常见的坑：production 会让 npm omit=dev
+        "npm_config_production",
+        "npm_config_only",
+        "NPM_CONFIG_PRODUCTION",
+        "NPM_CONFIG_ONLY",
+        "YARN_PRODUCTION",
+        "NODE_OPTIONS",      // 别人塞的 --max-old-space-size 之类，BOT 用不上还容易崩
+    ] {
+        cmd.env_remove(poisoned);
+    }
+
+
     // 独立进程组：dsh 自己会起子进程，杀父不杀子就是孤儿进程。
     // 杀了整组（kill -pgid）才叫真关死。
     #[cfg(unix)]
