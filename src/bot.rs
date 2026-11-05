@@ -406,6 +406,15 @@ pub fn run(
             })
         }
         None => {
+            // 会话文件被删了，但 BOT 的 .session-id 还记着它 → dsh 报
+            // `session "xxx" does not exist`。这时候该让它重新开一个会话，
+            // 而不是把这个 BOT 判死。实测在清理历史会话后批量出现。
+            if stderr_text.contains("does not exist") && stderr_text.contains("--session-id") {
+                // session id 存在**群目录**的 sessions/<bot>.session 里（不是 .session-id）。
+                // 删掉它，下次 spawn 就不带 --session-id，dsh 自己开一个新的。
+                let _ = std::fs::remove_file(&sess_path);
+                log_warn!("bot.session_gone", bot = name, path = sess_path.display().to_string());
+            }
             let tail: Vec<&str> = stderr_text.lines().rev().take(3).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
             let tail_str = tail.join(" | ");
