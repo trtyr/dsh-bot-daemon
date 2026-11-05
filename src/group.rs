@@ -247,6 +247,50 @@ impl GroupStore {
 
         // 群主还是原来那个（D010/D025）——认领换的是"门"，不是"主人"
         atomic_write(&meta_path, &meta.to_string()).map_err(|e| io_err("写群 meta", e))?;
+
+        // 一会话一群（D020）：把"原来指向我这个会话的其它群"让渡掉。
+        //
+        // 不这么做的话，一个会话会同时拥有好几个群（实测：认领后
+        // ['G-aaef5718','T-e59a0660'] 两个都指向同一个 session），
+        // 而 resolve 返回哪个取决于目录扫描顺序——**不确定的当前群**。
+        let mut released = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir() || dir.file_name().and_then(|n| n.to_str()) == Some(group_id) {
+                    continue;
+                }
+                let other_meta = dir.join("meta.json");
+                let Ok(raw) = fs::read_to_string(&other_meta) else { continue };
+                let Ok(mut other) = serde_json::from_str::<Value>(&raw) else { continue };
+                let points_to_me = other
+                    .get("originSession")
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    == Some(session_id);
+                if !points_to_me {
+                    continue;
+                }
+                // 让渡：清掉 originSession，记一笔"让给谁了"。数据一个不删。
+                if let Some(obj) = other.as_object_mut() {
+                    obj.remove("originSession");
+                    obj.insert(
+                        "adoptedOut".into(),
+                        json!({ "to": group_id, "at": now_stamp() }),
+                    );
+                }
+                if let Ok(text) = serde_json::to_string(&other) {
+                    if atomic_write(&other_meta, &text).is_ok() {
+                        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                            released.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !released.is_empty() {
+            log_info!("group.released", group = group_id, released = released.join(","));
+        }
         log_info!("group.adopted", group = group_id, session = session_id);
         Ok(meta)
     }
