@@ -51,7 +51,7 @@ use std::env;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tiny_http::{Method, Server};
@@ -71,6 +71,8 @@ pub struct State {
     pub groups: GroupStore,
     pub max_concurrent: usize,
     pub default_timeout_ms: u64,
+    /// 最后一次收到请求的时刻（空闲退出用，D032）。
+    pub last_active: Instant,
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -125,6 +127,12 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
+    // 空闲多久自动退（D032）。0 = 不退（调试用）。
+    let idle_timeout_secs: u64 = env::var("DSH_BOT_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800); // 默认 30 分钟
+
     let default_timeout_ms: u64 = env::var("DSH_BOT_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -155,6 +163,7 @@ fn main() {
     let state: Shared = Arc::new(Mutex::new(State {
         running: HashMap::new(),
         jobs: HashMap::new(),
+        last_active: Instant::now(),
         started_at: Instant::now(),
         agents_dir,
         groups: GroupStore::new(groups_root),
@@ -169,6 +178,31 @@ fn main() {
     // 实测：苏见微调钟诗雨时嵌套两次推理，/groups 直接超时。
     //
     // 并发上限由 max_concurrent 控（/run 里检查），不是靠串行控。
+    // 空闲退出（D032「谁用谁拉」的另一半）：没人用了就退，别常驻占资源。
+    // 有活干（running 或 jobs 里有 Running）就不退。
+    {
+        let idle_state = state.clone();
+        let idle_secs = idle_timeout_secs;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let should_exit = {
+                match idle_state.lock() {
+                    Ok(st) => {
+                        let idle = st.last_active.elapsed().as_secs();
+                        let busy = !st.running.is_empty()
+                            || st.jobs.values().any(|j| j.status == job::JobStatus::Running);
+                        idle >= idle_secs && !busy
+                    }
+                    Err(_) => false,
+                }
+            };
+            if should_exit {
+                log_info!("daemon.idle_exit", idle_secs = idle_secs);
+                std::process::exit(0);
+            }
+        });
+    }
+
     for request in server.incoming_requests() {
         let state = state.clone();
         std::thread::spawn(move || handle_request(state, request));
