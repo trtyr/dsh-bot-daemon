@@ -278,6 +278,55 @@ fn handle_request(state: Shared, mut request: tiny_http::Request) {
                 api::ok(request, json!({ "groupId": gid, "logged": true }));
             }
 
+            // ---- 认领旧群（D033：新会话接管已有的群）----
+            (Method::Post, "/groups/adopt") => {
+                let body = read_body(&mut request);
+                let gid = body
+                    .get("groupId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let session = body
+                    .get("originSession")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if gid.is_empty() {
+                    api::fail(
+                        request,
+                        &DaemonError::InvalidRequest {
+                            field: "groupId",
+                            reason: "必填".into(),
+                        },
+                    );
+                    return;
+                }
+                let store = {
+                    let s = lock(&state);
+                    GroupStore::new(s.groups.root.clone())
+                };
+                if !store.exists(&gid) {
+                    api::fail(request, &DaemonError::GroupNotFound { group_id: gid });
+                    return;
+                }
+                let gid2 = gid.clone();
+                let sid = if session.is_empty() { None } else { Some(session) };
+                match store.adopt(&gid2, sid.as_deref().unwrap_or("")) {
+                    Ok(meta) => api::ok(
+                        request,
+                        json!({
+                            "groupId": gid2,
+                            "adopted": true,
+                            "label": meta.get("label").cloned().unwrap_or(Value::Null),
+                            "members": meta.get("members").cloned().unwrap_or(json!([])),
+                        }),
+                    ),
+                    Err(e) => api::fail(request, &e),
+                }
+            }
+
             // ---- 按会话找群 / 建群（D020：群由会话生）----
             (Method::Post, "/groups/resolve") => {
                 let body = read_body(&mut request);

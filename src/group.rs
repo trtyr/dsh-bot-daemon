@@ -215,6 +215,42 @@ impl GroupStore {
         }
     }
 
+    /// 认领一个旧群（D033）：把它的 `originSession` 换成当前会话。
+    ///
+    /// 为什么需要：群的门是会话 id 做的（D020）。开新会话时 `resolve` 找不到旧群，
+    /// 于是只能建新的——明明数据都在，就是进不去。认领是那把钥匙。
+    ///
+    /// 记 `adoptedFrom` 留痕：以后能查"这个群本来是哪个会话开的"。
+    pub fn adopt(&self, group_id: &str, session_id: &str) -> Result<Value, DaemonError> {
+        let meta_path = self.dir(group_id).join("meta.json");
+        let raw = fs::read_to_string(&meta_path).map_err(|e| io_err("读群 meta", e))?;
+        let mut meta: Value = serde_json::from_str(&raw).map_err(|e| DaemonError::Internal {
+            context: "解析群 meta".into(),
+            reason: e.to_string(),
+        })?;
+
+        let previous = meta
+            .get("originSession")
+            .and_then(|o| o.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        meta["originSession"] = json!({
+            "id": session_id,
+            "createdAt": now_stamp(),
+        });
+        if let Some(prev) = previous {
+            if prev != session_id {
+                meta["adoptedFrom"] = json!([prev]);
+            }
+        }
+
+        // 群主还是原来那个（D010/D025）——认领换的是"门"，不是"主人"
+        atomic_write(&meta_path, &meta.to_string()).map_err(|e| io_err("写群 meta", e))?;
+        log_info!("group.adopted", group = group_id, session = session_id);
+        Ok(meta)
+    }
+
     /// 按会话找群（D020：同一个会话 resume 回来就是同一个群）。
     ///
     /// 扫 meta.json 的 `originSession.id`。群数量级是几十，扫一遍足够快。
